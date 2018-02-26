@@ -1,0 +1,175 @@
+#!/usr/bin/env python 
+
+# Like "w", but find all processes associated with a TTY (not just
+# those registered in wtmp), and reports all users that are running
+# anything. In particular, unlike "w", this will shows things running
+# in detached screens/tmuxen
+# From Wikipedia, the free encyclipedia
+# a) utmp, wtmp, btmp and variants such as utmpx, wtmpx and btmpx
+# are files on Unix-like systems that keep track of all logins and logouts to system.
+# b) glob -- Unix style pathname pattern expansion, finds all the pathnames matching
+# a specified pattern according to the rules used by the Unix shell.
+
+import sys, os, glob, pwd, time
+
+# Find all TTYs
+ttys = {}
+# /dev/pts are pseudo-terminals (pty for short)
+for tty in glob.glob("/dev/tty*") + glob.glob("/dev/pts/*"):
+    try:
+        # os.stat(path,*,dir_fd=None,follow_symlinks=True) Get the stats of a file or a file descriptor
+        st = os.stat(tty)
+    except EnvironmentError:
+        continue
+
+    # atime is time of last input
+    # mtime is time of last output
+    # ctime is when it was created
+    # st_rdev - Type of device if an inode device
+    ttys[st.st_rdev] = (tty[5:], st, [])
+
+# Find all process and map them to TTYs
+notty = {}
+uids = set()
+# /proc - a virtual filesystem. Each of the numbered directories corresponds to an actual process ID.
+# $ ps ax | grep sshd
+# 1634 ?        Ss     0:00 /usr/sbin/sshd -D
+# Details of this process can be obtained by looking at the associated files in the directory for this process, /proc/1634.
+# /proc/PID/cmdline     -- Command line arguments
+# /proc/PID/cpu         -- Current and last cpu in which it was executed
+# /proc/PID/cwd         -- Link to the current working directory
+# /proc/PID/environ     -- Values of environment variables
+# /proc/PID/exe         -- Link to the executable of this process
+# /proc/PID/fd          -- Directory,which contains all file descriptors
+# /proc/PID/maps        -- Memory maps to executables and library files
+# /proc/PID/mem         -- Memory held by this process
+# /proc/PID/root        -- Link to the root directory of this process
+# /proc/PID/stat        -- Process status
+# /proc/PID/statm       -- Process memory status information
+# /proc/PID/status      -- Process status in human readable form
+# ---------------------
+# /proc/cmdline -- Kernel command line
+# /proc/cpuinfo -- Information about the processor, such as its type, make, model, and performance
+# /proc/devices -- List of devices drivers configured into the currently running kernel
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    pid = int(pid)
+    try:
+        with open("/proc/%d/stat" % pid, 'r') as statusfile:
+            status = statusfile.read()
+        with open("/proc/%d/cmdline" % pid, 'r') as cmdlinefile:
+            cmdline = cmdlinefile.read()
+        st = os.stat("/proc/%d" % pid)
+    except EnvironmentError:
+        continue
+    # st_uid -- User identifier of the file owner
+    uids.add(st.st_uid)
+
+    parts = status.rsplit(") ", 1)[1].split()
+    # tty_nr %d -- The Controlling terminal of the process
+    tty_nr = int(parts[4])
+    # tpgid %d -- The ID of the foreground process group of the con-trolling terminal of the process
+    tpgid = int(parts[5])
+
+    if tty_nr == 0 or tpgid == -1:
+        # No controlling terminal
+        notty.setdefault(st.st_uid, 0)
+        notty[st.st_uid] += 1
+        continue
+
+    if cmdline.startswith("/sbin/getty\0"):
+        # Ignore login terminals
+        continue
+    if tpgid == int(pid) and tty_nr in ttys:
+        ttys[tty_nr][-1].append(cmdline.replace("\0", " "))
+
+# Sort TTYs by input time
+ttys = sorted(ttys.values(), key=lambda tty: tty[1].st_atime)
+
+# Print
+def pretty_time(ts):
+    diff = time.time() - ts
+    days, diff  = divmod(diff, 24*60*60)
+    hours, diff = divmod(diff, 60*60)
+    mins, secs  = divmod(diff, 60)
+    if days > 99:
+        return "%5dd" % days
+    if days:
+        return "%2dd%02dh" % (days, hours)
+    if hours:
+        return "%2dh%02dm" % (hours, mins)
+    if mins:
+        return "%2dm%02dm" % (mins, secs)
+    return "%5ds" % secs
+
+    # Old code for absolute time
+    lt = time.localtime(ts)
+    if lt[:3] == time.localtime()[:3]:
+        return "%02d:%02d" % (lt.tm_hour, lt.tm_min)
+    return time.strftime("%d%b%g", lt)
+
+def getTermSize():
+    # termios -- POSIX style tty control
+    # fcntl   -- file control, it is an interface to the fcntl() Unix routines
+    # struct  -- Interpret bytes as packed binary data
+    # errno   -- Standard errno system symbols
+    import termios, fcntl, struct, errno, os
+
+    # Try TIOCGWINSZ
+    try:
+        # TIOCGWINSZ -- TOC tl to G et the WIN dow SiZe
+        s = fcntl.ioctl(sys.stdout, termios.TIOCGWINSZ, struct.pack("HH", 0, 0))
+        h, w = struct.unpack("HH", s)
+        return w, h
+    except IOError as e:
+        if e.errno != errno.EINVAL:
+            raise
+
+    # Try environment
+    if "LINES" in os.environ and "COLUMNS" in os.environ:
+        h, w = int(os.environ["LINES"]), int(os.environ["COLUMNS"])
+        return w, h
+
+    # Give up
+    return 80, 24
+
+# /proc/uptime -- This file contains two numbers: the uptime of the system(sec-conds), and the amount of time spend in idle process (seconds)
+with open("/proc/uptime", 'r') as uptimefile:
+    uptime = int(float(uptimefile.read().split()[0]))
+# /proc/loadavg -- The first three fields 1,5,15 minutes, the fourth field , the fifth is the most recently created on the system.
+with open("/proc/loadavg", 'r') as loadavgfile:
+    loadavg = loadavgfile.read().split()
+print(" up %s %2d users  load %s %s %s procs %s" %(pretty_time(time.time() - uptime).strip(), len(uids), loadavg[0], loadavg[1], loadavg[2], loadavg[3]))
+
+fmt = "%-8.8s %-7s %6s %6s %6s %s"
+cols = getTermSize()[0]
+uid_colors = {}
+# Colors In Terminal
+# There're serveral ways of encoding an ESC
+# ASCII Oct \033
+# ASCII Hex \0x1B
+# SHELL \e
+# \033[ -- Control Sequence Introducer
+
+colors = [32, 33, 34, 35, 36]
+hdr = fmt % tuple("USER TTY LOGIN INPUT OUTPUT WHAT".split())
+hdr = hdr.replace("INPUT", "\033[31;4mINPUT\033[0m")
+print(hdr[:cols])
+for tty, st, cmds in ttys:
+    uid = st.st_uid
+    if uid not in uid_colors:
+        uid_colors[uid] = len(uid_colors) % len(colors)
+    color = "\033[%dm" % colors[uid_colors[uid]]
+    for cmd in cmds:
+        s = fmt % (pwd.getpwuid(st.st_uid)[0], tty, pretty_time(st.st_ctime), pretty_time(st.st_atime), pretty_time(st.st_mtime), cmd)
+        print(color + s[:cols] + "\033[0m")
+
+logged_in_uids = set()
+for tty in ttys:
+    logged_in_uids.add(tty[1].st_uid)
+for uid, count in notty.items():
+    if uid not in logged_in_uids:
+        continue
+    print("%-8.8s %-7s %d more process" % (pwd.getpwuid(uid)[0], "none", count))
+
